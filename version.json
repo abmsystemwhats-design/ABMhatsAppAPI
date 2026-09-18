@@ -1,0 +1,11 @@
+{
+  "version": "1.0.2",
+  "releaseDate": "2026-09-18",
+  "notes": "الإصدار الأول المستقر",
+  "changelog": [
+    "دعم Baileys / Evolution API / whatsapp-web.js",
+    "تحميل server.js و package.json من GitHub",
+    "Offline Fallback إلى Embedded"
+  ],
+  "minClientVersion": "1.0.0"
+}
