@@ -1,5 +1,5 @@
 {
-  ""name"": ""abmwhatsappapi"",
+  ""name"": "abmwhatsappapi",
   ""version"": ""1.0.2"",
   ""main"": ""server.js"",
   ""scripts"": { ""start"": ""node server.js"" },
