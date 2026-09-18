@@ -1,5 +1,5 @@
 {
-  ""name"": ""abm-whatsapp-evolution"",
+  ""name"": "abm-whatsapp-evolution",
   ""version"": ""1.0.2"",
   ""description"": ""ABM WhatsApp API - Baileys Enhanced"",
   ""main"": ""server.js"",
