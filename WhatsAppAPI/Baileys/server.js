@@ -1,519 +1,409 @@
-ABM_WHATSAPP_API_VERSION=__VERSION__
-const express = require('express');
-const cors = require('cors');
-const qrcode = require('qrcode');
-const fs = require('fs');
-const path = require('path');
+// ABM_WHATSAPP_API_VERSION=1.0.2
+import express from 'express';
+import cors from 'cors';
+import qrcode from 'qrcode';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import pino from 'pino';
+import {
+  default as makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  makeCacheableSignalKeyStore,
+  fetchLatestBaileysVersion,
+  Browsers
+} from '@whiskeysockets/baileys';
 
-process.env.PUPPETEER_CACHE_DIR =
-  process.env.PUPPETEER_CACHE_DIR || path.join(__dirname, '.puppeteer-cache');
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
 
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+console.log('[INIT] Baileys v7 loaded (ESM)');
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-function log(level, message) {
-  const timestamp = new Date().toISOString().substr(11, 8);
-  console.log('[' + timestamp + '] [' + level + '] ' + message);
+const logger = pino({ level: 'silent' });
+function log(l, m) {
+  console.log('[' + new Date().toISOString().substr(11, 8) + '] [' + l + '] ' + m);
 }
 
-// ===== Env =====
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
-const SESSION_NAME = process.env.SESSION_NAME || 'default';
-const HEADLESS_ENV = (process.env.HEADLESS || 'true').toLowerCase();
-const HEADLESS = HEADLESS_ENV !== 'false';
-const CHROME_PATH = process.env.CHROME_PATH || null;
+const PORT    = parseInt(process.env.PORT || '8080', 10);
+const SESSION = process.env.SESSION_NAME || 'default';
+const AUTH    = path.join(__dirname, 'baileys_auth', 'session-' + SESSION);
 
-// ===== Auth Storage =====
-const WWEBJS_DATA_DIR = path.join(__dirname, 'wwebjs_auth');
-try { fs.mkdirSync(WWEBJS_DATA_DIR, { recursive: true }); } catch {}
-const CLIENT_SESSION_DIR = path.join(WWEBJS_DATA_DIR, 'session-' + SESSION_NAME);
+let sock      = null;
+let qrData    = '';
+let connected = false;
+let curState  = 'init';
+let booting   = false;
+let timer     = null;
+let lastAct   = Date.now();
+let qrTries   = 0;
+let attempts  = 0;
 
-// ===== State =====
-let client = null;
-let qrCodeData = '';
-let sessionActive = false;
-let lastState = 'init';
-let starting = false;
-let restartTimer = null;
-let healthCheckInterval = null;
-let lastActivityTime = Date.now();
+const wait = ms => new Promise(r => setTimeout(r, ms));
 
-// ===== Lock with Timeout =====
-let opLock = Promise.resolve();
+function mkAuth() {
+  try { fs.mkdirSync(AUTH, { recursive: true }); } catch {}
+}
 
-function withLock(fn, timeoutMs) {
-  timeoutMs = timeoutMs || 30000;
-  return new Promise(function(resolve, reject) {
-    var timer = setTimeout(function() {
-      reject(new Error('Operation timeout'));
-    }, timeoutMs);
+function sched(ms) {
+  if (timer) return;
+  ms = Math.max(ms, 5000);
+  log('INFO', 'Restart in ' + (ms / 1000) + 's');
+  timer = setTimeout(() => {
+    timer = null;
+    boot().catch(() => {});
+  }, ms);
+}
 
-    var execute = async function() {
-      try {
-        var result = await fn();
-        clearTimeout(timer);
-        resolve(result);
-      } catch (err) {
-        clearTimeout(timer);
-        reject(err);
+function unsched() {
+  if (timer) { clearTimeout(timer); timer = null; }
+}
+
+function wipe() {
+  log('INFO', 'Wiping session...');
+  connected = false;
+  qrData    = '';
+  qrTries   = 0;
+  curState  = 'wiped';
+  try { fs.rmSync(AUTH, { recursive: true, force: true }); } catch {}
+  mkAuth();
+}
+
+async function cleanup() {
+  if (!sock) return;
+  try { sock.ev.removeAllListeners(); } catch {}
+  try { sock.ws.close(); } catch {}
+  try { sock.end(undefined); } catch {}
+  sock = null;
+}
+
+async function getVersion() {
+  try {
+    const v = await fetchLatestBaileysVersion();
+    if (v && v.version) {
+      log('INFO', 'WA version: ' + v.version.join('.'));
+      return v.version;
+    }
+  } catch (e) {
+    log('WARNING', 'Version fetch: ' + e.message);
+  }
+  return undefined;
+}
+
+async function boot() {
+  if (booting) return;
+  booting = true;
+  unsched();
+  attempts++;
+
+  if (attempts > 10) {
+    log('ERROR', 'Too many attempts. Wait 5 min...');
+    attempts = 0;
+    booting = false;
+    setTimeout(() => boot().catch(() => {}), 300000);
+    return;
+  }
+
+  try {
+    await cleanup();
+    await wait(2000);
+    curState = 'starting';
+    log('INFO', '=== Boot #' + attempts + ' ===');
+
+    mkAuth();
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH);
+
+    const cfg = {
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger)
+      },
+      logger,
+      printQRInTerminal: false,
+      browser: Browsers.windows('Desktop'),
+      connectTimeoutMs: 120000,
+      qrTimeout: 45000,
+      defaultQueryTimeoutMs: 60000,
+      keepAliveIntervalMs: 25000,
+      retryRequestDelayMs: 250,
+      markOnlineOnConnect: false,
+      generateHighQualityLinkPreview: false,
+      syncFullHistory: false,
+      fireInitQueries: false,
+      shouldIgnoreJid: jid => jid?.includes('@g.us') || jid?.includes('@broadcast'),
+      getMessage: async () => ({ conversation: '' }),
+      patchMessageBeforeSending: msg => {
+        if (msg.buttonsMessage || msg.listMessage || msg.templateMessage) {
+          msg = { viewOnceMessage: { message: { messageContextInfo: { deviceListMetadataVersion: 2, deviceListMetadata: {} }, ...msg } } };
+        }
+        return msg;
       }
     };
 
-    opLock = opLock.then(execute, execute);
-  });
-}
+    const ver = await getVersion();
+    if (ver) cfg.version = ver;
 
-// ===== Health Check =====
-function startHealthCheck() {
-  stopHealthCheck();
+    sock = makeWASocket(cfg);
 
-  healthCheckInterval = setInterval(async function() {
-    if (!sessionActive || !client) return;
+    sock.ev.on('connection.update', async u => {
+      const { qr, connection, lastDisconnect } = u;
 
-    try {
-      var state = await client.getState();
-      log('DEBUG', 'Health check - State: ' + state);
-
-      if (state === 'CONNECTED') {
-        lastActivityTime = Date.now();
-      } else if (state === 'UNPAIRED' || state === 'CONFLICT') {
-        log('WARNING', 'Health check bad state: ' + state);
-        sessionActive = false;
-        lastState = 'health_check_failed';
-        scheduleRestart(5000);
-      }
-    } catch (err) {
-      log('ERROR', 'Health check failed: ' + err.message);
-      sessionActive = false;
-      lastState = 'health_check_error';
-      scheduleRestart(5000);
-    }
-  }, 30000);
-
-  log('INFO', 'Health check started (every 30s)');
-}
-
-function stopHealthCheck() {
-  if (healthCheckInterval) {
-    clearInterval(healthCheckInterval);
-    healthCheckInterval = null;
-  }
-}
-
-// ===== Build Client =====
-function buildClient() {
-  var puppeteerOptions = {
-    headless: HEADLESS ? 'new' : false,
-    args: [
-      '--disable-gpu',
-      '--disable-dev-shm-usage',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-extensions',
-      '--disable-background-timer-throttling',
-      '--disable-backgrounding-occluded-windows',
-      '--disable-renderer-backgrounding',
-      '--disable-features=TranslateUI',
-      '--disable-ipc-flooding-protection',
-      '--disable-accelerated-2d-canvas',
-      '--disable-features=VizDisplayCompositor',
-      '--disable-hang-monitor',
-      '--js-flags=--max-old-space-size=512'
-    ],
-    timeout: 120000,
-    protocolTimeout: 120000
-  };
-
-  if (CHROME_PATH) {
-    puppeteerOptions.executablePath = CHROME_PATH;
-  }
-
-  return new Client({
-    authStrategy: new LocalAuth({
-      dataPath: WWEBJS_DATA_DIR,
-      clientId: SESSION_NAME
-    }),
-    puppeteer: puppeteerOptions,
-    qrMaxRetries: 5,
-    restartOnAuthFail: true,
-    takeoverOnConflict: true,
-    takeoverTimeoutMs: 10000,
-    webVersionCache: {
-      type: 'none'
-    }
-  });
-}
-
-// ===== Connection Management =====
-function scheduleRestart(delayMs) {
-  if (restartTimer) return;
-  log('INFO', 'Restart scheduled in ' + (delayMs / 1000) + 's');
-  restartTimer = setTimeout(function() {
-    restartTimer = null;
-    startWhatsapp().catch(function() {});
-  }, delayMs);
-}
-
-function cancelRestart() {
-  if (restartTimer) {
-    clearTimeout(restartTimer);
-    restartTimer = null;
-  }
-}
-
-async function cleanupClient() {
-  stopHealthCheck();
-  if (!client) return;
-
-  try {
-    client.removeAllListeners();
-    await Promise.race([
-      client.destroy(),
-      new Promise(function(_, reject) {
-        setTimeout(function() { reject(new Error('destroy timeout')); }, 15000);
-      })
-    ]);
-  } catch (err) {
-    log('WARNING', 'Cleanup warning: ' + err.message);
-    try {
-      var browser = client && client.pupBrowser;
-      if (browser) await browser.close();
-    } catch (e) {}
-  }
-
-  client = null;
-}
-
-async function resetSession() {
-  sessionActive = false;
-  qrCodeData = '';
-  lastState = 'reset_session';
-  try { fs.rmSync(CLIENT_SESSION_DIR, { recursive: true, force: true }); } catch {}
-}
-
-// ===== Start WhatsApp =====
-async function startWhatsapp() {
-  if (starting) {
-    log('WARNING', 'Already starting, skipping...');
-    return;
-  }
-  starting = true;
-  cancelRestart();
-
-  try {
-    await cleanupClient();
-    lastState = 'starting';
-    log('INFO', '=== Starting WhatsApp Client ===');
-
-    client = buildClient();
-
-    client.on('qr', async function(qr) {
-      try {
-        qrCodeData = await qrcode.toDataURL(qr);
-        sessionActive = false;
-        lastState = 'qr';
-        log('INFO', 'QR Code generated - waiting for scan');
-      } catch (e) {
-        log('ERROR', 'QR generate failed: ' + e.message);
-      }
-    });
-
-    client.on('authenticated', function() {
-      lastState = 'authenticated';
-      log('SUCCESS', 'Authenticated successfully');
-    });
-
-    client.on('ready', function() {
-      qrCodeData = '';
-      sessionActive = true;
-      lastState = 'ready';
-      lastActivityTime = Date.now();
-      log('SUCCESS', 'CONNECTED - WhatsApp ready!');
-      startHealthCheck();
-    });
-
-    client.on('auth_failure', async function(msg) {
-      sessionActive = false;
-      lastState = 'auth_failure';
-      log('ERROR', 'Auth failure: ' + msg);
-      await resetSession();
-      scheduleRestart(5000);
-    });
-
-    client.on('disconnected', async function(reason) {
-      sessionActive = false;
-      lastState = 'disconnected';
-      stopHealthCheck();
-      log('WARNING', 'Disconnected: ' + reason);
-
-      var reasonStr = String(reason || '').toLowerCase();
-      if (reasonStr.includes('logout') || reasonStr.includes('unpaired')) {
-        await resetSession();
-        scheduleRestart(5000);
-      } else {
-        scheduleRestart(10000);
-      }
-    });
-
-    client.on('change_state', function(state) {
-      log('INFO', 'Connection state changed: ' + state);
-      lastState = 'state_' + state;
-
-      if (state === 'CONNECTED') {
-        sessionActive = true;
-        lastActivityTime = Date.now();
-      } else if (state === 'OPENING') {
-        log('INFO', 'WhatsApp reconnecting...');
-      } else if (state === 'PAIRING') {
-        sessionActive = false;
-      } else if (state === 'TIMEOUT') {
-        log('WARNING', 'Connection TIMEOUT - will restart');
-        sessionActive = false;
-        scheduleRestart(10000);
-      }
-    });
-
-    client.on('loading_screen', function(percent, message) {
-      log('INFO', 'Loading: ' + percent + '% - ' + message);
-      lastState = 'loading_' + percent;
-    });
-
-    client.on('message', async function(msg) {
-      lastActivityTime = Date.now();
-
-      try {
-        if (msg.fromMe) return;
-        if (!msg.from) return;
-        if (msg.from.includes('@g.us')) return;
-        if (msg.from.includes('@broadcast')) return;
-        if (msg.from === 'status@broadcast') return;
-
-        if (msg.type !== 'chat' && msg.type !== 'image' && msg.type !== 'video') return;
-
-        var text = (msg.body || '').trim();
-        if (!text) return;
-
-        var sender = msg.from.split('@')[0];
-        var botPort = parseInt(process.env.BOT_PORT || '5001', 10);
-
-        var pushName = '';
+      if (qr) {
+        qrTries++;
+        attempts = 0;
+        log('INFO', 'QR received (' + qrTries + '/5)');
+        if (qrTries > 5) { wipe(); sched(10000); return; }
         try {
-          if (msg.getContact) {
-            var contact = await msg.getContact();
-            pushName = contact?.pushname || contact?.name || '';
-          }
-        } catch (e) { /* ignore */ }
+          qrData = await qrcode.toDataURL(qr, { errorCorrectionLevel: 'M', margin: 2, scale: 6 });
+          connected = false;
+          curState = 'qr';
+        } catch (e) { log('ERROR', 'QR gen: ' + e.message); }
+        return;
+      }
 
-        fetch('http://127.0.0.1:' + botPort + '/incoming', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            phone: sender,
-            message: text,
-            timestamp: Date.now(),
-            pushName: pushName
-          })
-        }).catch(function(err) {
-          log('WARNING', 'Bot forward failed: ' + err.message);
-        });
-      } catch (e) {
-        log('ERROR', 'Message handler: ' + e.message);
+      if (connection === 'open') {
+        qrData = ''; qrTries = 0; attempts = 0;
+        connected = true; curState = 'ready'; lastAct = Date.now();
+        log('SUCCESS', 'CONNECTED');
+        return;
+      }
+
+      if (connection === 'connecting') { curState = 'connecting'; return; }
+
+      if (connection === 'close') {
+        connected = false;
+        const code = lastDisconnect?.error?.output?.statusCode || 0;
+        log('WARNING', 'Closed: ' + code);
+
+        if (code === 401 || code === DisconnectReason.loggedOut) {
+          wipe(); sched(5000);
+        } else if (code === 405) {
+          log('WARNING', '405 - retry without wipe');
+          await cleanup();
+          sched(Math.min(attempts * 15000, 120000));
+        } else if (code === 403) {
+          wipe(); sched(180000);
+        } else if (code === 500 || code === DisconnectReason.badSession) {
+          wipe(); sched(5000);
+        } else if (code === 515 || code === DisconnectReason.restartRequired) {
+          sched(3000);
+        } else if (code === 408 || code === DisconnectReason.timedOut) {
+          sched(5000);
+        } else {
+          if (attempts >= 5) wipe();
+          sched(10000);
+        }
       }
     });
 
-    await Promise.race([
-      client.initialize(),
-      new Promise(function(_, reject) {
-        setTimeout(function() { reject(new Error('Initialize timeout (3 min)')); }, 180000);
-      })
-    ]);
+    sock.ev.on('creds.update', saveCreds);
 
-    lastState = 'initializing';
-  } catch (err) {
-    sessionActive = false;
-    lastState = 'start_error';
-    log('ERROR', 'startWhatsapp error: ' + err.message);
-    await cleanupClient();
-    scheduleRestart(15000);
-  } finally {
-    starting = false;
-  }
-}
+    // ═══════════════════════════════════════════════════════════
+    // 🤖 استقبال الرسائل الواردة وإرسالها إلى Bot Listener (C#)
+    // ═══════════════════════════════════════════════════════════
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      lastAct = Date.now();
+      if (type !== 'notify') return;
 
-// ===== Graceful Shutdown =====
-async function gracefulShutdown(signal) {
-  log('INFO', signal + ' received - shutting down...');
-  cancelRestart();
-  stopHealthCheck();
-  try { await cleanupClient(); } catch {}
-  process.exit(0);
-}
+      for (const msg of messages) {
+        try {
+                // تجاهل رسائلنا + المجموعات + الحالات
+      if (msg.key.fromMe) continue;
+      const jid = msg.key.remoteJid || '';
+      if (jid.includes('@g.us') || jid.includes('@broadcast') || jid === 'status@broadcast') continue;
 
-process.on('SIGTERM', function() { gracefulShutdown('SIGTERM'); });
-process.on('SIGINT', function() { gracefulShutdown('SIGINT'); });
+      // استخراج النص
+      const text = msg.message?.conversation
+                || msg.message?.extendedTextMessage?.text
+                || msg.message?.imageMessage?.caption
+                || msg.message?.videoMessage?.caption
+                || '';
 
-process.on('uncaughtException', function(err) {
-  log('ERROR', 'Uncaught Exception: ' + err.message);
-});
+      if (!text || !text.trim()) continue;
 
-process.on('unhandledRejection', function(reason) {
-  log('ERROR', 'Unhandled Rejection: ' + (reason && reason.message ? reason.message : reason));
-});
+      // ═══════════════════════════════════════════════════════════
+      // 🔧 الحل: معالجة LID JIDs (Baileys v7)
+      // ═══════════════════════════════════════════════════════════
+      let sender = '';
 
-// ===== Error Handler =====
-function handleClientError(res, err, context) {
-  var msg = (err && err.message) ? err.message : String(err);
-  log('ERROR', context + ' failed: ' + msg);
+      if (jid.includes('@lid')) {
+        // محاولة استخراج الرقم الحقيقي من الحقول البديلة
+        const altJid = msg.key.remoteJidAlt
+                    || msg.key.participantAlt
+                    || msg.key.senderPn
+                    || '';
 
-  var msgLower = msg.toLowerCase();
-  if (
-    msgLower.includes('detached frame') ||
-    msgLower.includes('session closed') ||
-    msgLower.includes('target closed') ||
-    msgLower.includes('protocol error') ||
-    msgLower.includes('page crashed') ||
-    msgLower.includes('browser disconnected')
-  ) {
-    sessionActive = false;
-    lastState = 'browser_error';
-    scheduleRestart(3000);
-  }
-
-  return res.status(500).json({
-    valid: false, exists: false,
-    status: 'error',
-    error: 'CHECK_FAILED',
-    details: msg
-  });
-}
-
-// ===== Start =====
-startWhatsapp().catch(function(err) { log('ERROR', err.message); });
-
-// ===== Routes =====
-app.get('/qr', function(req, res) {
-  res.json({ qr: qrCodeData });
-});
-
-app.get('/status', function(req, res) {
-  res.json({
-    connected: sessionActive,
-    starting: starting,
-    state: lastState,
-    lastActivity: new Date(lastActivityTime).toISOString(),
-    uptime: Math.floor((Date.now() - lastActivityTime) / 1000) + 's ago'
-  });
-});
-
-app.post('/check-number', function(req, res) {
-  return withLock(async function() {
-    if (!sessionActive || !client) {
-      return res.status(503).json({ valid: false, exists: false, error: 'Not connected' });
-    }
-
-    var number = req.body.number;
-    if (!number) {
-      return res.status(400).json({ valid: false, exists: false, error: 'No number provided' });
-    }
-
-    var cleanNumber = number.toString().replace(/\D/g, '');
-    if (cleanNumber.length < 8 || cleanNumber.length > 15) {
-      return res.status(400).json({ valid: false, exists: false, error: 'Invalid number length', number: cleanNumber });
-    }
-
-    var wid = cleanNumber + '@c.us';
-
-    try {
-      var exists = await client.isRegisteredUser(wid);
-      lastActivityTime = Date.now();
-      return res.json({ valid: true, exists: exists, jid: wid, number: cleanNumber });
-    } catch (err) {
-      return handleClientError(res, err, 'check-number');
-    }
-  }, 20000).catch(function(err) {
-    return res.status(500).json({ valid: false, exists: false, error: err.message });
-  });
-});
-
-app.post('/send', function(req, res) {
-  return withLock(async function() {
-    if (!sessionActive || !client) {
-      return res.status(503).json({ status: 'error', message: 'Not connected' });
-    }
-
-    var number = req.body.number;
-    var message = req.body.message;
-    var media = req.body.media;
-    var filename = req.body.filename;
-    var mediaType = req.body.mediaType;
-    var mimetype = req.body.mimetype;
-
-    if (!number) {
-      return res.status(400).json({ status: 'error', message: 'No number provided' });
-    }
-
-    var cleanNumber = number.toString().replace(/\D/g, '');
-    if (cleanNumber.length < 8 || cleanNumber.length > 15) {
-      return res.status(400).json({ status: 'error', message: 'Invalid number length', number: cleanNumber });
-    }
-
-    var chatId = cleanNumber + '@c.us';
-    log('INFO', 'Sending to: ' + cleanNumber);
-
-    try {
-      var exists = await client.isRegisteredUser(chatId);
-      if (!exists) {
-        return res.json({ status: 'error', message: 'Number not on WhatsApp', number: cleanNumber });
-      }
-    } catch (err) {
-      return handleClientError(res, err, 'send-precheck');
-    }
-
-    try {
-      var sent = null;
-
-      if (media) {
-        var mt = mimetype || (mediaType === 'image' ? 'image/jpeg' : 'application/pdf');
-        var name = filename || (mediaType === 'image' ? 'image.jpg' : 'document.pdf');
-        var mm = new MessageMedia(mt, media, name);
-        sent = await client.sendMessage(chatId, mm, { caption: message || '' });
+        if (altJid && altJid.includes('@s.whatsapp.net')) {
+          sender = altJid.split('@')[0];
+          log('INFO', 'LID resolved: ' + jid + ' → ' + sender);
+        } else {
+          // لا يوجد بديل — تجاهل الرسالة مع تسجيل
+          log('WARNING', 'Skipping LID message (no alt): ' + jid);
+          continue;
+        }
       } else {
-        sent = await client.sendMessage(chatId, message || '');
+        // JID عادي (رقم هاتف)
+        sender = jid.split('@')[0];
       }
 
-      lastActivityTime = Date.now();
-      var messageId = (sent && sent.id && sent.id._serialized) ? sent.id._serialized : ((sent && sent.id) ? sent.id : null);
-      return res.json({ status: 'sent', messageId: messageId, to: chatId });
-    } catch (err) {
-      return handleClientError(res, err, 'send');
-    }
-  }, 60000).catch(function(err) {
-    return res.status(500).json({ status: 'error', error: err.message });
-  });
+      if (!sender) continue;
+
+      const botPort = parseInt(process.env.BOT_PORT || '5001', 10);
+          // إرسال إلى C# Bot Listener
+          fetch(`http://127.0.0.1:${botPort}/incoming`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              phone: sender,
+              message: text.trim(),
+              timestamp: Date.now(),
+              pushName: msg.pushName || ''
+            })
+          }).catch(err => {
+            log('WARNING', 'Bot forward failed: ' + err.message);
+          });
+
+        } catch (e) {
+          log('ERROR', 'Message handler: ' + e.message);
+        }
+      }
+    });
+
+    curState = 'initializing';
+    log('INFO', 'Socket created');
+
+  } catch (err) {
+    connected = false; curState = 'error';
+    log('ERROR', 'Boot: ' + err.message);
+    sched(15000);
+  } finally {
+    booting = false;
+  }
+}
+
+mkAuth();
+wait(1500).then(() => boot().catch(e => log('ERROR', e.message)));
+
+/* ===== Routes ===== */
+app.get('/qr', (_, res) => res.json({ qr: qrData, state: curState, retry: qrTries }));
+
+app.get('/status', (_, res) => res.json({
+  connected, starting: booting, state: curState, engine: 'baileys',
+  qrAvailable: !!qrData, qrRetry: qrTries, connectionAttempts: attempts,
+  lastActivity: new Date(lastAct).toISOString()
+}));
+
+app.post('/check-number', async (req, res) => {
+  try {
+    if (!connected || !sock) return res.status(503).json({ valid: false, exists: false, error: 'Not connected' });
+    const num = (req.body.number || '').toString().replace(/\D/g, '');
+    if (num.length < 8 || num.length > 15) return res.status(400).json({ valid: false, exists: false, error: 'Invalid length' });
+    const jid = num + '@s.whatsapp.net';
+    const r = await Promise.race([sock.onWhatsApp(jid), wait(15000).then(() => { throw new Error('Timeout'); })]);
+    lastAct = Date.now();
+    res.json({ valid: true, exists: r?.[0]?.exists || false, jid, number: num });
+  } catch (e) { res.status(500).json({ valid: false, exists: false, error: e.message }); }
 });
 
-app.get('/logout', async function(req, res) {
+app.post('/send', async (req, res) => {
   try {
-    try { await client.logout(); } catch (e) {}
-    await resetSession();
-    await cleanupClient();
-    scheduleRestart(3000);
-    return res.json({ status: 'logged_out' });
-  } catch (err) {
-    return res.status(500).json({ status: 'error', error: err.message });
+    if (!connected || !sock) return res.status(503).json({ status: 'error', message: 'Not connected' });
+    const { number, message, media, filename, mediaType, mimetype } = req.body;
+    if (!number) return res.status(400).json({ status: 'error', message: 'No number' });
+    const num = number.toString().replace(/\D/g, '');
+    const jid = num + '@s.whatsapp.net';
+    try {
+      const chk = await Promise.race([sock.onWhatsApp(jid), wait(10000).then(() => { throw new Error('timeout'); })]);
+      if (!chk?.[0]?.exists) return res.json({ status: 'error', message: 'Not on WhatsApp' });
+    } catch {}
+    let sent;
+    if (media) {
+      const buf = Buffer.from(media, 'base64');
+      const mt = mimetype || (mediaType === 'image' ? 'image/jpeg' : 'application/pdf');
+      if (mediaType === 'image') sent = await sock.sendMessage(jid, { image: buf, caption: message || '', mimetype: mt });
+      else sent = await sock.sendMessage(jid, { document: buf, caption: message || '', mimetype: mt, fileName: filename || 'document.pdf' });
+    } else {
+      sent = await sock.sendMessage(jid, { text: message || '' });
+    }
+    lastAct = Date.now();
+    res.json({ status: 'sent', messageId: sent?.key?.id, to: jid });
+  } catch (e) { res.status(500).json({ status: 'error', error: e.message }); }
+});
+
+app.get('/logout', async (_, res) => {
+  try {
+    if (sock) try { await sock.logout(); } catch {}
+    wipe(); await cleanup(); sched(5000);
+    res.json({ status: 'logged_out' });
+  } catch (e) { res.status(500).json({ status: 'error', error: e.message }); }
+});
+
+app.get('/restart', async (_, res) => {
+  unsched(); await cleanup(); attempts = 0;
+  await wait(1000); boot().catch(() => {});
+  res.json({ status: 'restarting' });
+});
+
+// ═══════════════════════════════════════════════════════════
+// 🤖 Bot Reply - بدون check-number (أسرع للرد التلقائي)
+// ═══════════════════════════════════════════════════════════
+app.post('/reply', async (req, res) => {
+  try {
+    if (!connected || !sock)
+      return res.status(503).json({ status: 'error', message: 'Not connected' });
+
+    const { number, message } = req.body || {};
+    if (!number || !message)
+      return res.status(400).json({ status: 'error', message: 'Missing params' });
+
+    const num = String(number).replace(/\D/g, '');
+    if (num.length < 8 || num.length > 15)
+      return res.status(400).json({ status: 'error', message: 'Invalid number' });
+
+    const jid = num + '@s.whatsapp.net';
+    const sent = await sock.sendMessage(jid, { text: message });
+
+    lastAct = Date.now();
+    res.json({
+      status: 'sent',
+      messageId: sent?.key?.id || '',
+      to: jid
+    });
+  } catch (e) {
+    log('ERROR', 'Reply: ' + e.message);
+    res.status(500).json({ status: 'error', error: e.message });
   }
 });
 
-app.get('/restart', async function(req, res) {
-  log('INFO', 'Manual restart requested');
-  cancelRestart();
-  startWhatsapp().catch(function() {});
-  return res.json({ status: 'restarting' });
+app.get('/reset', async (_, res) => {
+  unsched(); await cleanup(); wipe(); attempts = 0;
+  await wait(2000); boot().catch(() => {});
+  res.json({ status: 'reset' });
+});
+app.get('/me', (_, res) => {
+  if (!connected || !sock) {
+    return res.status(503).json({ number: null, name: null });
+  }
+  try {
+    const jid = sock.user?.id || '';
+    // جيد مثلاً: 9665xxxxxxxx:xx@s.whatsapp.net
+    const number = jid.split(':')[0].split('@')[0];
+    const name   = sock.user?.name || '';
+    res.json({ number, name, jid });
+  } catch (e) {
+    res.status(500).json({ number: null, name: null, error: e.message });
+  }
 });
 
-app.listen(PORT, '0.0.0.0', function() {
-  log('INFO', 'SERVER_STARTED on port ' + PORT);
-});
+app.get('/health', (_, res) => res.json({ status: 'ok', connected }));
+
+process.on('SIGTERM', async () => { await cleanup(); process.exit(0); });
+process.on('SIGINT',  async () => { await cleanup(); process.exit(0); });
+process.on('uncaughtException',  e => log('ERROR', 'Uncaught: ' + e.message));
+process.on('unhandledRejection', e => log('ERROR', 'Unhandled: ' + e));
+
+app.listen(PORT, '0.0.0.0', () => log('INFO', 'SERVER_STARTED port=' + PORT));
