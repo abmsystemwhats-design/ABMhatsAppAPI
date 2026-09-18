@@ -1,4 +1,4 @@
-// ABM_WHATSAPP_API_VERSION=__VERSION__
+// ABM_WHATSAPP_API_VERSION=1.0.2
 // Engine: Baileys Enhanced (Stable)
 const express = require('express');
 const cors    = require('cors');
